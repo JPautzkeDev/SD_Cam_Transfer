@@ -112,7 +112,9 @@ Destination/
 |---|---|
 | **Copy files** | Copies photos to destination; originals remain on the card/camera |
 | **Move files** | Copies to destination, then deletes originals from the source |
-| **Overwrite existing files** | If a file with the same name already exists in the date folder, it will be replaced. If unchecked, a number suffix is appended (e.g. `DSCF0001_1.RAF`) |
+| **Auto-rename** | If a file with the same name already exists in the date folder, a number suffix is appended (e.g. `DSCF0001_1.RAF`). Default behavior. |
+| **Skip** | If a file with the same name already exists, it is left on the source and not copied. Useful for incremental imports where you don't want to re-copy photos already transferred. |
+| **Overwrite** | Replaces any existing file in the destination with the same name |
 
 ---
 

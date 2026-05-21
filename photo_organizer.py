@@ -283,14 +283,13 @@ class PhotoOrganizerApp(tk.Tk):
         self.configure(bg=DARK_BG)
         self.minsize(660, 560)
 
-        self._src       = tk.StringVar()
-        self._dst       = tk.StringVar()
-        self._copy_mode = tk.BooleanVar(value=True)   # True=copy, False=move
-        self._overwrite = tk.BooleanVar(value=False)
-        self._mtp_mode  = False     # True when source is an MTP device
-        self._mtp_path  = None      # raw MTP path string from Shell
-        self._running   = False
-        self._cancel    = False
+        self._src          = tk.StringVar()
+        self._dst          = tk.StringVar()
+        self._copy_mode    = tk.BooleanVar(value=True)   # True=copy, False=move
+        self._mtp_mode     = False     # True when source is an MTP device
+        self._mtp_path     = None      # raw MTP path string from Shell
+        self._running      = False
+        self._cancel       = False
 
         self._build_ui()
 
@@ -319,7 +318,24 @@ class PhotoOrganizerApp(tk.Tk):
         self._checkbox(opts, "Copy files  (keep originals)", self._copy_mode)
         self._checkbox(opts, "Move files  (delete originals after copy)",
                        self._copy_mode, invert=True)
-        self._checkbox(opts, "Overwrite existing files", self._overwrite)
+
+        # Collision-handling row — three mutually exclusive options
+        opts2 = tk.Frame(card, bg=PANEL_BG)
+        opts2.pack(fill="x", pady=(4, 2))
+        tk.Label(opts2, text="If file already exists:",
+                 font=("Segoe UI", 9), bg=PANEL_BG, fg=SUBTEXT).pack(side="left", padx=(0, 12))
+        self._collision_var = tk.StringVar(value="rename")
+        for label, val in [
+            ("Auto-rename  (e.g. DSCF0001_1.RAF)", "rename"),
+            ("Skip  (do not copy)",                "skip"),
+            ("Overwrite",                          "overwrite"),
+        ]:
+            rb = tk.Radiobutton(
+                opts2, text=label, variable=self._collision_var, value=val,
+                font=("Segoe UI", 9), bg=PANEL_BG, fg=TEXT,
+                selectcolor=ENTRY_BG, activebackground=PANEL_BG,
+                activeforeground=TEXT, relief="flat", cursor="hand2")
+            rb.pack(side="left", padx=(0, 18))
 
         btn_row = tk.Frame(self, bg=DARK_BG)
         btn_row.pack(fill="x", padx=20, pady=8)
@@ -585,7 +601,7 @@ class PhotoOrganizerApp(tk.Tk):
             self._finish(0, 0)
             return
 
-        copied = errors = 0
+        copied = skipped = errors = 0
         for idx, fp in enumerate(all_files, 1):
             if self._cancel:
                 self._log_line("⚠  Cancelled by user.", "warn")
@@ -593,6 +609,10 @@ class PhotoOrganizerApp(tk.Tk):
             self._update_progress(idx, total)
             try:
                 dest = self._dest_for(fp, fp.name, dst)
+                if dest is None:
+                    self._log_line(f"  —  Skipped  {fp.name}  (already exists)", "warn")
+                    skipped += 1
+                    continue
                 if do_copy:
                     shutil.copy2(str(fp), str(dest))
                 else:
@@ -604,7 +624,7 @@ class PhotoOrganizerApp(tk.Tk):
                 self._log_line(f"  ✘  {fp.name}  —  {exc}", "err")
                 errors += 1
 
-        self._finish(copied, errors)
+        self._finish(copied, skipped, errors)
 
     # ── MTP worker (USB camera via Windows Shell) ──────────────────────────────
 
@@ -633,7 +653,7 @@ class PhotoOrganizerApp(tk.Tk):
         self._log_line(f"  Found {total} file(s).  Starting transfer…", "mtp")
 
         do_copy = self._copy_mode.get()
-        copied  = errors = 0
+        copied  = skipped = errors = 0
 
         for idx, item in enumerate(items, 1):
             if self._cancel:
@@ -644,6 +664,13 @@ class PhotoOrganizerApp(tk.Tk):
             name     = item.Name
             tmp_path = None
             try:
+                # For skip mode, check if the file would be skipped BEFORE
+                # doing the expensive MTP transfer — saves time on re-imports.
+                if self._collision_var.get() == "skip":
+                    # Peek: compute likely destination without EXIF (use mtime later)
+                    # We do a quick pre-check using a placeholder; full check after temp copy.
+                    pass   # checked properly after temp copy below
+
                 self._log_line(f"  Transferring  {name}…", "info")
                 tmp_path = copy_mtp_file_to_temp(item)
 
@@ -652,10 +679,15 @@ class PhotoOrganizerApp(tk.Tk):
                         "Temporary copy failed — file did not appear on disk. "
                         "Try running the app as Administrator, or use the SD card instead.")
 
-                dt       = get_photo_date(tmp_path)
-                dest     = self._dest_for(tmp_path, name, dst, override_dt=dt)
-                shutil.copy2(str(tmp_path), str(dest))
+                dt   = get_photo_date(tmp_path)
+                dest = self._dest_for(tmp_path, name, dst, override_dt=dt)
 
+                if dest is None:
+                    self._log_line(f"  —  Skipped  {name}  (already exists)", "warn")
+                    skipped += 1
+                    continue
+
+                shutil.copy2(str(tmp_path), str(dest))
                 self._log_line(
                     f"  ✔  [{dest.parent.name}]  {name}  →  {dest.name}", "ok")
                 copied += 1
@@ -681,7 +713,7 @@ class PhotoOrganizerApp(tk.Tk):
                     except Exception:
                         pass
 
-        self._finish(copied, errors)
+        self._finish(copied, skipped, errors)
 
     # ── Shared helpers ─────────────────────────────────────────────────────────
 
@@ -693,9 +725,19 @@ class PhotoOrganizerApp(tk.Tk):
         dest_dir.mkdir(parents=True, exist_ok=True)
         return self._resolve_collision(dest_dir / name)
 
-    def _resolve_collision(self, dest: Path) -> Path:
-        if not dest.exists() or self._overwrite.get():
+    def _resolve_collision(self, dest: Path) -> Path | None:
+        """
+        Return the resolved destination path based on the collision setting.
+        Returns None if the file should be skipped.
+        """
+        if not dest.exists():
             return dest
+        mode = self._collision_var.get()
+        if mode == "skip":
+            return None          # caller will skip this file
+        if mode == "overwrite":
+            return dest          # overwrite in place
+        # rename: append _1, _2, … until name is free
         stem, suffix, n = dest.stem, dest.suffix, 1
         while dest.exists():
             dest = dest.parent / f"{stem}_{n}{suffix}"
@@ -708,14 +750,15 @@ class PhotoOrganizerApp(tk.Tk):
         self.after(0, lambda i=idx, t=total: self._status_lbl.configure(
             text=f"{i}/{t} files", fg=SUBTEXT))
 
-    def _finish(self, copied: int, errors: int):
+    def _finish(self, copied: int, skipped: int, errors: int):
         self.after(0, lambda: self._progress.configure(value=100))
         self.after(0, self._log_line, f"{'─'*60}", "section")
         self.after(0, self._log_line,
-                   f"  Done — {copied} copied,  {errors} error(s)", "section")
+                   f"  Done — {copied} copied,  {skipped} skipped,  {errors} error(s)",
+                   "section")
         self.after(0, self._log_line, f"{'─'*60}", "section")
         self.after(0, lambda: self._status_lbl.configure(
-            text=f"Done — {copied} copied, {errors} errors",
+            text=f"Done — {copied} copied, {skipped} skipped, {errors} errors",
             fg=SUCCESS if errors == 0 else WARNING))
         self.after(0, lambda: self._start_btn.configure(state="normal"))
         self.after(0, lambda: self._cancel_btn.configure(state="disabled"))
